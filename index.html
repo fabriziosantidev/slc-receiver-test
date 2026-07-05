@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming LAN Cast Receiver</title>
+<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #14161a; overflow: hidden; }
+  /* Native player (Shaka) so the TV remote, phone and Google Home controls and BACK/exit all work
+     (CAFv3 drives these through its own player). shakaConfig keeps playback tolerant of the source's
+     segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer). */
+  cast-media-player {
+    --splash-image: url('icon-256.png');
+    --splash-size: 132px;
+    --background-color: #14161a;
+    --progress-color: #e30f0f;
+    --title-color: #ffffff;
+    --theme-hue: 220;
+  }
+  /* Branded loading screen. CAF's own --splash-image only shows in the idle state, not during the gap
+     while a stream is still loading, so show our logo over that gap and hide it once playback starts. */
+  #splash {
+    position: fixed; inset: 0; z-index: 20; background: #14161a;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px;
+  }
+  #splash img { width: 168px; height: 168px; }
+  #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
+  #splash.gone { display: none; }
+  /* On-screen key readout for debugging remote input; hidden until toggled from the remote. */
+  #keydbg {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999; display: none;
+    padding: 10px 18px; text-align: center;
+    background: rgba(0, 0, 0, 0.72); color: #fff;
+    font: 700 2.6vw/1.3 monospace; letter-spacing: 0.03em;
+  }
+</style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
+  <div id="keydbg"></div>
+  <script>
+    const NS = 'urn:x-cast:slc';
+    const RX_VERSION = '1.5';
+    const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
+    window.__stats = stats;
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+    const splash = document.getElementById('splash');   // branded loading overlay (hidden once playing)
+
+    // Tolerant Shaka config: survive the source's segment 404s, stalls and discontinuities.
+    // Merged over CAF's Shaka defaults.
+    const playbackConfig = new cast.framework.PlaybackConfig();
+    playbackConfig.segmentRequestRetryLimit = 10;     // don't give up on a 404'd segment after 3
+    playbackConfig.autoResumeDuration = 2;            // resume quickly after an auto-pause
+    playbackConfig.autoResumeNumberOfSegments = 1;
+    playbackConfig.shakaConfig = {
+      streaming: {
+        retryParameters: { maxAttempts: 8, baseDelay: 400, backoffFactor: 1.5, fuzzFactor: 0.5,
+                           timeout: 9000, stallTimeout: 5000, connectionTimeout: 6000 },
+        bufferingGoal: 30,          // buffer deep so bursty delivery + stalls don't starve playback
+        rebufferingGoal: 2,
+        bufferBehind: 30,
+        stallEnabled: true,         // detect a frozen playhead...
+        stallThreshold: 1,
+        stallSkip: 0.1,             // ...and nudge across it (crosses small PTS holes)
+        gapDetectionThreshold: 0.5, // jump gaps left by dropped segments
+        ignoreTextStreamFailures: true,
+      },
+      manifest: {
+        retryParameters: { maxAttempts: 8, baseDelay: 400, backoffFactor: 1.5, timeout: 9000 },
+        defaultPresentationDelay: 10,   // sit ~10s behind live (stable, not the raw edge)
+      },
+    };
+
+    // LOAD: a direct media file (video/*, served with byte-range seeking) or a VOD HLS (tagged ?vod=1)
+    // plays as a seekable BUFFERED stream; a live source stays LIVE. Headers/token are injected by the
+    // helper's proxy, so the player just fetches our CORS-enabled proxy - no per-request auth here.
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
+      try {
+        const m = req.media || {};
+        splash.classList.remove('gone');   // show the loading logo while the new stream loads
+        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
+        const url = m.contentUrl || '';
+        const path = url.split('?')[0];
+        // A direct file plays through CAF's own player; an HLS playlist plays through Shaka. contentType
+        // picks which.
+        if (path.endsWith('.webm')) m.contentType = 'video/webm';
+        else if (path.endsWith('.mp4') || path.endsWith('.m4v') || path.endsWith('.mov')) m.contentType = 'video/mp4';
+        else m.contentType = 'application/x-mpegurl';
+        const isVod = url.indexOf('vod=1') !== -1;
+        m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
+                             : cast.framework.messages.StreamType.LIVE;
+        // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
+        // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
+        // a VOD seeks freely and has no live edge, so it drops the presentation delay.
+        const lowLat = url.indexOf('ll=1') !== -1;
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 10);
+        playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
+        stats.lastError = 'loading:' + url.slice(0, 40);
+      } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
+      return req;
+    });
+
+    // telemetry so the helper log shows whether Shaka plays or chokes (and why)
+    const EV = cast.framework.events.EventType;
+    playerManager.addEventListener(EV.ERROR, (e) => {
+      // capture the internal Shaka error (category.code + data) so the log shows exactly what was
+      // rejected (network / manifest / media / codec).
+      let d = 'shaka/' + (e && e.detailedErrorCode);
+      try {
+        const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
+        if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
+      } catch (x) {}
+      stats.lastError = d;
+    });
+    playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
+    playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
+    setInterval(() => {
+      const v = document.getElementsByTagName('video')[0];
+      let st = 'idle', t = 0, buf = 0;
+      try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
+      if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
+      if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
+    }, 2000);
+
+    // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the
+    // portable event.key name first (Chromecast / Google TV report 'BrowserBack') and fall back to the
+    // known TV back codes: 166 (legacy BrowserBack), 461 (HbbTV / most TV browsers), 10009 (Tizen).
+    // Some Android TV / Google TV builds handle BACK in the system and close the app before this runs.
+    function isBackKey(e) {
+      const key = (e.key || '').toLowerCase();
+      if (key === 'browserback' || key === 'goback' || key === 'back') return true;
+      return e.keyCode === 166 || e.keyCode === 461 || e.keyCode === 10009;
+    }
+
+    // Debug readout: press Up, Up, Down, Down on the remote to toggle an on-screen panel showing the
+    // code/key of each press - handy to read what an unfamiliar device sends for BACK. Off by default,
+    // so normal playback shows nothing. The last key also rides along in the status telemetry above.
+    const keyDbg = document.getElementById('keydbg');
+    let dbgOn = false;
+    const combo = [];
+    function dirOf(e) {
+      const k = (e.key || '').toLowerCase();
+      if (k === 'arrowup' || e.keyCode === 38) return 'up';
+      if (k === 'arrowdown' || e.keyCode === 40) return 'down';
+      return '';
+    }
+    function showKey(e) {
+      stats.lastKey = { code: e.keyCode, key: e.key || '' };
+      if (dbgOn) keyDbg.textContent = 'keyCode ' + e.keyCode + '   key "' + (e.key || '') + '"   back=' + isBackKey(e);
+    }
+    function toggleCheck(e) {
+      const d = dirOf(e);
+      if (!d) return;
+      combo.push(d);
+      if (combo.length > 4) combo.shift();
+      if (combo.join(',') === 'up,up,down,down') {
+        dbgOn = !dbgOn;
+        keyDbg.style.display = dbgOn ? 'block' : 'none';
+        keyDbg.textContent = dbgOn ? 'key debug ON' : '';
+        combo.length = 0;
+      }
+    }
+
+    // With the player controls visible, a back press just hides them (CAF's default); with them already
+    // hidden it exits. CAF shows the controls on any remote key and auto-hides them a few seconds later,
+    // so "time since the last key" stands in for the controls being visible. Capture phase, so this runs
+    // before <cast-media-player> consumes the key.
+    let lastKeyAt = 0;
+    window.addEventListener('keydown', (e) => {
+      showKey(e);
+      const controlsVisible = (Date.now() - lastKeyAt) < 4500;
+      if (isBackKey(e)) {
+        if (controlsVisible) {
+          lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
+        } else {
+          e.preventDefault(); e.stopPropagation();
+          try { context.stop(); } catch (x) {}     // controls already hidden -> exit the receiver
+        }
+      } else {
+        lastKeyAt = Date.now();                    // any other remote key shows the controls
+        toggleCheck(e);
+      }
+    }, true);
+
+    const options = new cast.framework.CastReceiverOptions();
+    options.useShakaForHls = true;   // play HLS with Shaka (not CAF's legacy player) so the tolerant
+                                     // shakaConfig above applies and the native controls work.
+    options.playbackConfig = playbackConfig;
+    options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
+    options.maxInactivity = 3600;
+    context.start(options);
+  </script>
+</body>
+</html>
