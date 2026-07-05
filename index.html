@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.6';
+    const RX_VERSION = '1.7';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -107,21 +107,23 @@
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
     playerManager.addEventListener(EV.ERROR, (e) => {
-      // Surface the real reason behind CAF's generic detailedErrorCode: the internal Shaka error can
-      // arrive as e.error, e.errorInfo.error, or e.errorInfo itself (a shaka.util.Error is category.code
-      // .data); the shadow-DOM <video>'s MediaError separates decode/codec from network.
+      // capture the internal Shaka error (category.code + data) behind CAF's generic detailedErrorCode.
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
-        const er = e && (e.error || (e.errorInfo && (e.errorInfo.error || e.errorInfo)));
-        if (er && (er.category != null || er.code != null))
-          d += ' [' + er.category + '.' + er.code + ' ' + JSON.stringify(er.data || []).slice(0, 90) + ']';
-        else if (er)
-          d += ' [' + String(er.message || er.name || JSON.stringify(er)).slice(0, 90) + ']';
-        const cmp = document.querySelector('cast-media-player');
-        const vid = cmp && cmp.shadowRoot && cmp.shadowRoot.querySelector('video');
-        if (vid && vid.error) d += ' media=' + vid.error.code + (vid.error.message ? ('/' + String(vid.error.message).slice(0, 60)) : '');
-      } catch (x) { d += ' cap/' + x.message; }
+        const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
+        if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
+      } catch (x) {}
       stats.lastError = d;
+    });
+    // Catch Shaka errors that CAF swallows before its ERROR event (they surface as rejected promises /
+    // window errors), so the helper log shows the real category.code instead of only a generic 905.
+    window.addEventListener('unhandledrejection', (ev) => {
+      try { const r = ev.reason;
+        stats.lastError = 'rej/' + (r && r.code != null ? (r.category + '.' + r.code + ' ' + JSON.stringify(r.data || []).slice(0, 70)) : String(r && r.message || r)).slice(0, 100);
+      } catch (e) {}
+    });
+    window.addEventListener('error', (ev) => {
+      try { stats.lastError = 'winerr/' + String(ev.message || (ev.error && ev.error.message) || ev.error).slice(0, 100); } catch (e) {}
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
