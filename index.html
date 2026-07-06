@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.7';
+    const RX_VERSION = '1.5';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -107,23 +107,14 @@
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
     playerManager.addEventListener(EV.ERROR, (e) => {
-      // capture the internal Shaka error (category.code + data) behind CAF's generic detailedErrorCode.
+      // capture the internal Shaka error (category.code + data) so the log shows exactly what was
+      // rejected (network / manifest / media / codec).
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
         const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
         if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
       } catch (x) {}
       stats.lastError = d;
-    });
-    // Catch Shaka errors that CAF swallows before its ERROR event (they surface as rejected promises /
-    // window errors), so the helper log shows the real category.code instead of only a generic 905.
-    window.addEventListener('unhandledrejection', (ev) => {
-      try { const r = ev.reason;
-        stats.lastError = 'rej/' + (r && r.code != null ? (r.category + '.' + r.code + ' ' + JSON.stringify(r.data || []).slice(0, 70)) : String(r && r.message || r)).slice(0, 100);
-      } catch (e) {}
-    });
-    window.addEventListener('error', (ev) => {
-      try { stats.lastError = 'winerr/' + String(ev.message || (ev.error && ev.error.message) || ev.error).slice(0, 100); } catch (e) {}
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
