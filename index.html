@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.5';
+    const RX_VERSION = '1.6';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -99,6 +99,10 @@
         const lowLat = url.indexOf('ll=1') !== -1;
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 10);
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
+        // Low-latency HLS: fetch the sub-second #EXT-X-PART parts and ride the edge with blocking reloads.
+        // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
+        // without this Shaka fetches empty segments and never fills its buffer.
+        playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod;
         stats.lastError = 'loading:' + url.slice(0, 40);
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
