@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.6';
+    const RX_VERSION = '1.7';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -89,6 +89,7 @@
         // picks which.
         if (path.endsWith('.webm')) m.contentType = 'video/webm';
         else if (path.endsWith('.mp4') || path.endsWith('.m4v') || path.endsWith('.mov')) m.contentType = 'video/mp4';
+        else if (path.endsWith('.mpd')) m.contentType = 'application/dash+xml';
         else m.contentType = 'application/x-mpegurl';
         const isVod = url.indexOf('vod=1') !== -1;
         m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
