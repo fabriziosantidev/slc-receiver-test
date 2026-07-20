@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.9d';
+    const RX_VERSION = '1.9e';
     const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
     window.__stats = stats;
 
@@ -119,6 +119,13 @@
         // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
         // without this Shaka fetches empty segments and never fills its buffer.
         playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod;
+        // A locally transcoded source (tc=1) produces segments on the fly and its server holds a
+        // request open until the segment exists; give those requests time to be answered instead of
+        // aborting at the 5s no-bytes stall cutoff and re-firing each track on its own clock (tracks
+        // then join MSE far apart, which desyncs some TVs).
+        const isTc = url.indexOf('tc=1') !== -1;
+        playbackConfig.shakaConfig.streaming.retryParameters.timeout = isTc ? 50000 : 9000;
+        playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
