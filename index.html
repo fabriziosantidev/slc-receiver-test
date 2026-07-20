@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.9f';
+    const RX_VERSION = '1.9g';
     const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
     window.__stats = stats;
 
@@ -157,8 +157,17 @@
       return v;
     }
     let hooked = null;
-    let relatchArm = false;
     stats.relatch = 0;
+    function sbCovers(kind, t, lead) {
+      for (const x of sbs) {
+        if (x.k !== kind) continue;
+        try {
+          const b = x.sb.buffered;
+          for (let i = 0; i < b.length; i++) if (t >= b.start(i) && t + lead <= b.end(i)) return true;
+        } catch (e) {}
+      }
+      return false;
+    }
     function bufferedCovers(t) {
       for (const x of sbs) {
         try {
@@ -168,23 +177,43 @@
       }
       return false;
     }
+    // A seek INTO buffered content latches this TV's audio/video render clocks correctly; a seek
+    // OUTSIDE the buffer (tracks streaming in while the element waits) latches them apart even though
+    // the appended data is aligned. So turn every unbuffered seek into a buffered one: hold the
+    // element paused, wait until BOTH tracks cover the target, then re-seek into the buffer and play.
+    let fix = null;   // { own, iv } - the pending unbuffered-seek recovery
+    function cancelFix() { if (fix) { clearInterval(fix.iv); fix = null; } }
     function hookMedia(v) {
       if (!v || hooked === v) return;
       hooked = v;
       v.addEventListener('seeking', () => {
         stats.lastSeek = 'seeking@' + Math.round(v.currentTime);
-        // A seek landing outside the buffer streams both tracks in while the element waits; some TVs'
-        // MSE then latches the audio and video render clocks apart even though the appended data is
-        // aligned. Arm a one-shot corrective micro re-seek for when playback resumes (a seek WITHIN
-        // the buffer, including the micro re-seek itself, doesn't need it and doesn't re-arm).
-        relatchArm = !bufferedCovers(v.currentTime);
+        if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
+        cancelFix();
+        if (bufferedCovers(v.currentTime)) return;
+        const target = v.currentTime;
+        const wasPaused = v.paused;
+        const t0 = Date.now();
+        try { v.pause(); } catch (e) {}
+        stats.relatch++;
+        fix = { own: 0 };
+        fix.iv = setInterval(() => {
+          const lead = Math.max(0.5, Math.min(4, (v.duration || 1e9) - target - 0.3));
+          if (sbCovers('v', target, lead) && sbCovers('a', target, lead)) {
+            clearInterval(fix.iv);
+            fix.own = target + 0.001;
+            try { v.currentTime = fix.own; } catch (e) {}
+            if (!wasPaused) { try { v.play(); } catch (e) {} }
+            setTimeout(cancelFix, 3000);
+          } else if (Date.now() - t0 > 90000) {
+            cancelFix();
+            if (!wasPaused) { try { v.play(); } catch (e) {} }
+          }
+        }, 250);
       });
       v.addEventListener('seeked', () => { stats.lastSeek = 'seeked@' + Math.round(v.currentTime); });
       v.addEventListener('playing', () => {
-        if (!relatchArm) return;
-        relatchArm = false;
-        stats.relatch++;
-        setTimeout(() => { try { v.currentTime = v.currentTime + 0.05; } catch (e) {} }, 250);
+        if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
       });
       v.addEventListener('waiting', () => { stats.waits++; });
     }
