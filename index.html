@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.36';
+    const RX_VERSION = '1.37';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -494,9 +494,25 @@
       clearTimeout(spdHide);
       spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
     }
+    // The element inside the player that holds the remote's focus, if any. From the document,
+    // focus inside the player's shadow tree reads as the player itself.
+    function focusedControl() {
+      const a = document.activeElement;
+      if (!a || a === document.body || a === document.documentElement) return null;
+      const host = document.querySelector('cast-media-player');
+      if (!host || (a !== host && !host.contains(a))) return null;
+      return (host.shadowRoot && host.shadowRoot.activeElement) || a;
+    }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
       if (!dir) return false;
+      // With the controls up and one of the player's own buttons focused, the remote is moving
+      // among those buttons, so a left or right press goes through to that navigation. Once the
+      // controls are down, the press is a skip, and clearing the stale focus keeps the repeats of
+      // a held key skipping instead of resuming the navigation on the next tick.
+      const fc = focusedControl();
+      if (fc && (Date.now() - lastKeyAt) < 4500) return false;
+      if (fc) { try { fc.blur(); } catch (x) {} }
       const v = mediaEl();
       if (!v) return false;
       // A source with a finite duration runs from 0 to that duration. A replayed window runs over
