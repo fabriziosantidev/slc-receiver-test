@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.37';
+    const RX_VERSION = '1.38';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -161,6 +161,25 @@
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
     });
+
+    // Whether the platform's own screen, such as a transport bar it draws over the player, has
+    // the remote: the platform says so with a focus-state message, where it supports one. The
+    // last few keys seen, and whether each was taken here, travel with the status.
+    const focus = { state: '', at: 0, keys: [] };
+    function noteKey(e, taken) {
+      focus.keys.push((e.key || '?') + ':' + (e.keyCode | 0) + (e.isTrusted ? '' : '*') + (taken ? '!' : ''));
+      if (focus.keys.length > 8) focus.keys.shift();
+    }
+    try {
+      const MT = cast.framework.messages.MessageType;
+      if (MT.FOCUS_STATE) {
+        playerManager.setMessageInterceptor(MT.FOCUS_STATE, (req) => {
+          focus.state = String((req && req.state) || '');
+          focus.at = Date.now();
+          return req;
+        });
+      }
+    } catch (e) { stats.lastError = 'focus-intercept/' + e.message; }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
       intent.paused = true;
@@ -373,8 +392,19 @@
         } catch (e) {}
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
+      let ae = null;
+      try {
+        const a = document.activeElement;
+        if (a && a !== document.body && a !== document.documentElement) {
+          ae = a.tagName.toLowerCase() + (a.id ? '#' + a.id : '') + (a.className ? '.' + String(a.className).slice(0, 24) : '');
+          const inner = a.shadowRoot && a.shadowRoot.activeElement;
+          if (inner) ae += '>' + inner.tagName.toLowerCase() + (inner.id ? '#' + inner.id : '') + (inner.className ? '.' + String(inner.className).slice(0, 24) : '');
+        }
+      } catch (e) {}
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
         pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
+        fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
+        ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
@@ -494,22 +524,31 @@
       clearTimeout(spdHide);
       spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
     }
-    // The element inside the player that holds the remote's focus, if any. From the document,
-    // focus inside the player's shadow tree reads as the player itself.
+    // The element that holds the remote's focus, if any: a control of the player's, or anything
+    // else on the page that took it. From the document, focus inside a shadow tree reads as its
+    // host, so the host's own view of it is preferred when there is one.
     function focusedControl() {
       const a = document.activeElement;
       if (!a || a === document.body || a === document.documentElement) return null;
-      const host = document.querySelector('cast-media-player');
-      if (!host || (a !== host && !host.contains(a))) return null;
-      return (host.shadowRoot && host.shadowRoot.activeElement) || a;
+      return (a.shadowRoot && a.shadowRoot.activeElement) || a;
+    }
+    // Until when the remote is taken to be moving about a screen of the platform's own, which a
+    // press of down brings up over the player: while that lasts, left and right go to that screen.
+    // The platform may also say outright that the player is not the one in focus.
+    const NAV_HOLD = 6000;
+    let navUntil = 0;
+    function platformHasRemote() {
+      if (focus.state === 'NOT_IN_FOCUS') return true;
+      return Date.now() < navUntil;
     }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
       if (!dir) return false;
-      // With the controls up and one of the player's own buttons focused, the remote is moving
-      // among those buttons, so a left or right press goes through to that navigation. Once the
-      // controls are down, the press is a skip, and clearing the stale focus keeps the repeats of
-      // a held key skipping instead of resuming the navigation on the next tick.
+      // With the controls up and one of the player's own buttons focused, or with the platform's
+      // own screen holding the remote, a left or right press is navigation and goes through
+      // as is. Once the controls are down, the press is a skip, and clearing the stale focus
+      // keeps the repeats of a held key skipping instead of resuming the navigation on the next tick.
+      if (platformHasRemote()) { navUntil = Date.now() + NAV_HOLD; return false; }
       const fc = focusedControl();
       if (fc && (Date.now() - lastKeyAt) < 4500) return false;
       if (fc) { try { fc.blur(); } catch (x) {} }
@@ -570,8 +609,13 @@
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
-      if (tryAcceleratedSeek(e)) { lastKeyAt = Date.now(); return; }
+      const kk = (e.key || '').toLowerCase();
+      if (e.isTrusted && (kk === 'arrowdown' || e.keyCode === 40)) navUntil = Date.now() + NAV_HOLD;
+      else if (e.isTrusted && navUntil && (kk === 'enter' || e.keyCode === 13)) navUntil = Date.now() + NAV_HOLD;
+      if (tryAcceleratedSeek(e)) { noteKey(e, true); lastKeyAt = Date.now(); return; }
+      noteKey(e, false);
       if (isBackKey(e)) {
+        navUntil = 0;
         if (controlsVisible) {
           lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
         } else {
