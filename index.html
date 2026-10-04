@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.38';
+    const RX_VERSION = '1.39';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -524,34 +524,28 @@
       clearTimeout(spdHide);
       spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
     }
-    // The element that holds the remote's focus, if any: a control of the player's, or anything
-    // else on the page that took it. From the document, focus inside a shadow tree reads as its
-    // host, so the host's own view of it is preferred when there is one.
-    function focusedControl() {
-      const a = document.activeElement;
-      if (!a || a === document.body || a === document.documentElement) return null;
-      return (a.shadowRoot && a.shadowRoot.activeElement) || a;
-    }
-    // Until when the remote is taken to be moving about a screen of the platform's own, which a
-    // press of down brings up over the player: while that lasts, left and right go to that screen.
-    // The platform may also say outright that the player is not the one in focus.
-    const NAV_HOLD = 6000;
-    let navUntil = 0;
-    function platformHasRemote() {
+    // Whether the remote is on one of the controls the platform lays over the player. That layer
+    // holds the focus whenever it is idle, on an element of its own; a press of down moves it to a
+    // button or to the scrubber, and left and right then move it between them. The platform may
+    // also say outright that the player is not the one in focus. A control still focused once no
+    // key has come from the remote for a while is a leftover rather than navigation.
+    const NAV_IDLE = 8000;
+    let lastRemoteAt = 0;
+    function navFocused() {
       if (focus.state === 'NOT_IN_FOCUS') return true;
-      return Date.now() < navUntil;
+      const a = document.activeElement;
+      if (!a || a === document.body || a === document.documentElement) return false;
+      const el = (a.shadowRoot && a.shadowRoot.activeElement) || a;
+      if (el === a) return false;
+      if (/\blayer\b/i.test(String(el.className || ''))) return false;
+      return (Date.now() - lastRemoteAt) < NAV_IDLE;
     }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
       if (!dir) return false;
-      // With the controls up and one of the player's own buttons focused, or with the platform's
-      // own screen holding the remote, a left or right press is navigation and goes through
-      // as is. Once the controls are down, the press is a skip, and clearing the stale focus
-      // keeps the repeats of a held key skipping instead of resuming the navigation on the next tick.
-      if (platformHasRemote()) { navUntil = Date.now() + NAV_HOLD; return false; }
-      const fc = focusedControl();
-      if (fc && (Date.now() - lastKeyAt) < 4500) return false;
-      if (fc) { try { fc.blur(); } catch (x) {} }
+      // On the platform's control layer with a button or the scrubber focused, a left or right
+      // press moves between them and goes through as is. Anywhere else it is a skip.
+      if (navFocused()) return false;
       const v = mediaEl();
       if (!v) return false;
       // A source with a finite duration runs from 0 to that duration. A replayed window runs over
@@ -609,13 +603,10 @@
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
-      const kk = (e.key || '').toLowerCase();
-      if (e.isTrusted && (kk === 'arrowdown' || e.keyCode === 40)) navUntil = Date.now() + NAV_HOLD;
-      else if (e.isTrusted && navUntil && (kk === 'enter' || e.keyCode === 13)) navUntil = Date.now() + NAV_HOLD;
+      if (e.isTrusted) lastRemoteAt = Date.now();
       if (tryAcceleratedSeek(e)) { noteKey(e, true); lastKeyAt = Date.now(); return; }
       noteKey(e, false);
       if (isBackKey(e)) {
-        navUntil = 0;
         if (controlsVisible) {
           lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
         } else {
