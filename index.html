@@ -27,29 +27,39 @@
   #splash img { width: 168px; height: 168px; }
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
-  /* On-screen key readout for debugging remote input; hidden until toggled from the remote. */
-  #keydbg {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999; display: none;
-    padding: 10px 18px; text-align: center;
-    background: rgba(0, 0, 0, 0.72); color: #fff;
-    font: 700 2.6vw/1.3 monospace; letter-spacing: 0.03em;
-  }
+  /* Held-seek marker riding above the scrubber: where the seek has reached, and one arrow per step.
+     It carries its own time because the player's controls fade to a bare bar while a seek runs. */
+  #spd { position: fixed; z-index: 15; transform: translate(-50%, -100%);
+         display: flex; align-items: baseline; gap: 10px; white-space: nowrap;
+         padding: 6px 12px; border-radius: 10px; background: rgba(0,0,0,.72);
+         text-shadow: 0 1px 4px rgba(0,0,0,.85);
+         opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #spd.on { opacity: .95; }
+  #spdT { color: #fff; font: 600 24px/1 system-ui, sans-serif; }
+  #spdA { color: #e30f0f; font: 700 22px/1 system-ui, sans-serif; letter-spacing: 2px; }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
-  <div id="keydbg"></div>
+  <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.9h';
-    const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
-    window.__stats = stats;
+    const RX_VERSION = '1.35';
+    const stats = { stalls: 0, lastError: null };
+    // Budget for the startup nudge below, held here so the load interceptor can refill it without
+    // reaching forward to a declaration that has not run yet.
+    const nudge = { left: 3, prevT: -1, at: 0, want: 0, starting: false };
+    // Whether the viewer stopped this. The element's paused flag cannot say: playback pauses on its
+    // own while a source is swapped, while a seek settles and while the player waits, and every one
+    // of those reads the same as a press of the pause key. A press arrives as a command, so that is
+    // what gets recorded, and a load starts the cast off meaning to play.
+    const intent = { paused: false };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
-    // Diagnostic build: capture each MSE SourceBuffer as the player creates it, so telemetry can
-    // report the buffered ranges of audio and video separately (the media element's .buffered only
-    // exposes their intersection, which hides which track is starving or gapped).
+    // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
+    // whether audio and video separately cover a seek target (the media element's .buffered only
+    // exposes their intersection).
     const sbs = [];
     const _addSB = MediaSource.prototype.addSourceBuffer;
     MediaSource.prototype.addSourceBuffer = function (mime) {
@@ -94,10 +104,13 @@
       try {
         const m = req.media || {};
         sbs.length = 0;                    // new load -> new MediaSource; drop the old SourceBuffers
-        splash.classList.remove('gone');   // show the loading logo while the new stream loads
         m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
         const url = m.contentUrl || '';
         const path = url.split('?')[0];
+        // Show the loading logo for a fresh cast only. A LOAD tagged sw=1 swaps the source of a cast
+        // already on screen (a rewind, or a recovery), where the logo would turn a short gap into a
+        // full restart cue.
+        if (url.indexOf('sw=1') === -1) splash.classList.remove('gone');
         // A direct file plays through CAF's own player; an HLS playlist plays through Shaka. contentType
         // picks which.
         if (path.endsWith('.webm')) m.contentType = 'video/webm';
@@ -111,7 +124,12 @@
         // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
         // a VOD seeks freely and has no live edge, so it drops the presentation delay.
         const lowLat = url.indexOf('ll=1') !== -1;
-        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 14);
+        // A window that travels is a live presentation underneath, whatever it is presented as, so it
+        // is tuned like one. Left to the manifest's own suggestion the player holds three segments
+        // back, which is most of a minute away from the edge it was asked to sit at.
+        const replay = url.indexOf('rp=1') !== -1;
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
+          replay ? 6 : (isVod ? 0 : (lowLat ? 3 : 14));
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
@@ -129,27 +147,59 @@
         playbackConfig.shakaConfig.streaming.retryParameters.timeout = isTc ? 50000 : 9000;
         playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
+        nudge.left = 3; nudge.prevT = -1; nudge.at = 0;
+        nudge.want = Number(req.currentTime) || 0;
+        nudge.starting = true;
+        intent.paused = false;
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
+      return req;
+    });
+
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
+      intent.paused = true;
+      return req;
+    });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (req) => {
+      intent.paused = false;
       return req;
     });
 
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
+    // Name whatever fields an object actually carries. CAF nests the underlying player error under
+    // several shapes, so reading fixed keys off it reports nothing; listing the keys that are there
+    // shows what was rejected (network / manifest / media / codec) whichever shape arrived.
+    function describe(o, depth) {
+      if (o == null || typeof o !== 'object') return String(o).slice(0, 48);
+      const out = [];
+      for (const k of Object.keys(o).slice(0, 8)) {
+        const v = o[k];
+        if (v == null || typeof v === 'function') continue;
+        out.push(k + '=' + (typeof v === 'object' ? (depth > 0 ? describe(v, depth - 1) : '{}')
+                                                  : String(v).slice(0, 32)));
+      }
+      return '{' + out.join(' ') + '}';
+    }
     playerManager.addEventListener(EV.ERROR, (e) => {
-      // capture the internal Shaka error (category.code + data) so the log shows exactly what was
-      // rejected (network / manifest / media / codec).
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
+        if (e && e.reason != null) d += ' reason=' + e.reason;
         const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
-        if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
-      } catch (x) {}
-      stats.lastError = d;
+        if (er) d += ' err=' + describe(er, 1);
+        // the media element keeps its own error, which survives when the event carries none
+        const v = mediaEl();
+        if (v && v.error) d += ' media=' + v.error.code + '/' + String(v.error.message || '').slice(0, 32);
+      } catch (x) { d += ' describe/' + x.message; }
+      stats.lastError = d.slice(0, 200);
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
-    playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
+    playerManager.addEventListener(EV.PLAYING, () => {
+      splash.classList.add('gone');   // hide the loading logo once playback starts
+      nudge.starting = false;         // the load's own seek has landed; the playhead is the element's again
+    });
 
     // The media element lives inside <cast-media-player>'s shadow root, so a plain tag lookup finds
-    // nothing (and telemetry then reports t=0/buf=0 forever). Pierce the shadow root.
+    // nothing. Pierce the shadow root to hook it and to read its position/buffer for the status telemetry.
     function mediaEl() {
       let v = document.getElementsByTagName('video')[0];
       if (!v) {
@@ -159,7 +209,6 @@
       return v;
     }
     let hooked = null;
-    stats.relatch = 0;
     function sbCovers(kind, t, lead) {
       for (const x of sbs) {
         if (x.k !== kind) continue;
@@ -169,6 +218,11 @@
         } catch (e) {}
       }
       return false;
+    }
+    function splitTracks() {
+      let a = false, v = false;
+      for (const x of sbs) { if (x.k === 'a') a = true; else if (x.k === 'v') v = true; }
+      return a && v;
     }
     function bufferedCovers(t) {
       for (const x of sbs) {
@@ -183,67 +237,256 @@
     // OUTSIDE the buffer (tracks streaming in while the element waits) latches them apart even though
     // the appended data is aligned. So turn every unbuffered seek into a buffered one: hold the
     // element paused, wait until BOTH tracks cover the target, then re-seek into the buffer and play.
+    // Two SourceBuffers are what makes that possible. A muxed buffer carries one clock for both
+    // tracks, so the hold is skipped there; it would only add a wait.
     let fix = null;   // { own, iv } - the pending unbuffered-seek recovery
     function cancelFix() { if (fix) { clearInterval(fix.iv); fix = null; } }
     function hookMedia(v) {
       if (!v || hooked === v) return;
       hooked = v;
       v.addEventListener('seeking', () => {
-        stats.lastSeek = 'seeking@' + Math.round(v.currentTime);
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
+        if (nudge.starting) return;   // the load reaching its own start position, which it settles itself
+        // A hold in flight is itself what paused the element, so its captured flag is the only record
+        // of whether the viewer had this playing; carry that forward rather than reading back the
+        // pause we made. Whatever ends a hold owes playback its state back, early returns included.
+        const wasPaused = fix ? fix.wasPaused : intent.paused;
+        const resume = fix && !wasPaused ? () => { try { v.play(); } catch (e) {} } : () => {};
         cancelFix();
-        // Only a transcode feeds MSE here; anything else (a progressive file) is seeked by the player
-        // itself against its own buffer, which these SourceBuffer checks cannot see.
-        if (!tcMode || !sbs.length) return;
-        if (bufferedCovers(v.currentTime)) return;
+        // Any source fed through MSE, not only a locally transcoded one, can land with its two tracks
+        // covering different ranges, which plays as audio adrift from the picture. A progressive file
+        // creates no SourceBuffers and is seeked by the player against its own buffer, so it is left
+        // alone. A held seek steps every few hundred ms, and settling on each step would fight the
+        // gesture, so wait until it ends; the nudge in tryAcceleratedSeek brings us back here then.
+        if (!splitTracks()) return resume();
+        if (Date.now() - lastSeekKey < SEEK_END) return resume();
+        if (bufferedCovers(v.currentTime)) return resume();
         const target = v.currentTime;
-        const wasPaused = v.paused;
         const t0 = Date.now();
         try { v.pause(); } catch (e) {}
-        stats.relatch++;
-        fix = { own: 0 };
+        fix = { own: 0, wasPaused, at: t0 };
         fix.iv = setInterval(() => {
-          const lead = Math.max(0.5, Math.min(4, (v.duration || 1e9) - target - 0.3));
+          const room = (v.duration || 0) - target - 0.3;   // 0 for an unknown duration, so: floor
+          const lead = room > 0 ? Math.max(0.4, Math.min(1.5, room)) : 0.4;
           if (sbCovers('v', target, lead) && sbCovers('a', target, lead)) {
             clearInterval(fix.iv);
             fix.own = target + 0.001;
             try { v.currentTime = fix.own; } catch (e) {}
             if (!wasPaused) { try { v.play(); } catch (e) {} }
             setTimeout(cancelFix, 3000);
-          } else if (Date.now() - t0 > 90000) {
+          } else if (Date.now() - t0 > 6000) {
             cancelFix();
             if (!wasPaused) { try { v.play(); } catch (e) {} }
           }
         }, 250);
       });
-      v.addEventListener('seeked', () => { stats.lastSeek = 'seeked@' + Math.round(v.currentTime); });
       v.addEventListener('playing', () => {
-        if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
+        // The player auto-resumes off its own buffering state right after the hold pauses it, which
+        // would defeat the hold; a play arriving later than that is the viewer's, and it wins.
+        if (fix && !fix.own && Date.now() - fix.at < 2000) { try { v.pause(); } catch (e) {} }
+        else if (fix && !fix.own) cancelFix();
       });
-      v.addEventListener('waiting', () => { stats.waits++; });
-    }
-    function rangesOf(b) {
-      const out = [];
-      try { for (let i = 0; i < b.length && out.length < 4; i++) out.push([Math.round(b.start(i) * 10) / 10, Math.round(b.end(i) * 10) / 10]); } catch (e) {}
-      return out;
+      // Report a backward playhead jump the moment it happens. timeupdate ticks ~4x a second for
+      // free, so this catches what the 2s status samples can slide past, and it costs nothing while
+      // playback moves forward. One message per jump, never a stream of them.
+      let lastT = 0;
+      v.addEventListener('timeupdate', () => {
+        const t = v.currentTime;
+        if (lastT && t < lastT - 0.5) {
+          try { context.sendCustomMessage(NS, undefined, { type: 'tjump', ver: RX_VERSION,
+            from: Math.round(lastT * 10) / 10, to: Math.round(t * 10) / 10 }); } catch (e) {}
+        }
+        lastT = t;
+      });
     }
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
-      let st = 'idle', t = 0, buf = 0, rs = -1, paused = null;
+      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null, pa = null, rs = null, lsr = null;
+      // What the cast framework itself holds as the live range: the span its own live controls would
+      // be drawn from, if it is drawing any. Named beside the element's view of the same stream.
+      try {
+        const r = playerManager.getLiveSeekableRange && playerManager.getLiveSeekableRange();
+        if (r) lsr = [Math.round(r.start || 0), Math.round(r.end || 0), r.isMovingWindow ? 1 : 0];
+      } catch (e) {}
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) {
-        t = Math.round(v.currentTime * 10) / 10; rs = v.readyState; paused = !!v.paused;
-        try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {}
+        t = Math.round(v.currentTime * 10) / 10;
+        // What the element itself thinks, so a playhead that will not move can be told apart from one
+        // held by a pause, one starved of decodable data, and one a nudge has already tried to start.
+        pa = !!v.paused;
+        rs = v.readyState | 0;
+        // buf reaches to the end of the last range, which holds whether or not the playhead is inside
+        // one: a playhead parked in a gap ahead of the media reads as a deep buffer that never plays.
+        // cov says whether the playhead sits in buffered content, b0 where the content starts.
+        try {
+          const b = v.buffered;
+          if (b.length) {
+            buf = Math.round((b.end(b.length - 1) - v.currentTime) * 10) / 10;
+            b0 = Math.round(b.start(0) * 10) / 10;
+            cov = false;
+            for (let i = 0; i < b.length; i++) {
+              if (v.currentTime >= b.start(i) && v.currentTime < b.end(i)) cov = true;
+            }
+          }
+        } catch (e) {}
       }
-      const bufs = {};
-      for (const x of sbs) { try { bufs[x.k] = rangesOf(x.sb.buffered); } catch (e) {} }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
-      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, rs, paused,
-        vbuf: bufs.v || null, abuf: bufs.a || null, seek: stats.lastSeek || null, waits: stats.waits | 0,
-        relatch: stats.relatch | 0,
-        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
+        pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
+        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
+
+    // A cast can settle with the playhead on the first buffered sample and never start: the element
+    // sits at a position the decoder has nothing to render at, so it waits while the buffer behind it
+    // keeps filling. A small step into the buffer starts it. Every load can land that way, a swap to
+    // another source and a recovery reload included, so the budget refills whenever one begins.
+    // A viewer's own pause is the one state left alone: pausing takes a playback to pause, so a
+    // paused element that has played is theirs, while one that is not paused and still will not move
+    // is waiting on nothing.
+    setInterval(() => {
+      const v = mediaEl();
+      if (!v || nudge.left <= 0) return;
+      if (intent.paused) return;
+      // Until the element has metadata its currentTime is a placeholder, not the playhead: a load
+      // that named a position keeps that position of its own and writes it once metadata lands, and
+      // it adopts whatever the element reads if that is not zero by then. So a reading of nothing
+      // moving is not a fact yet, and writing one here would take the position the viewer asked for.
+      if (v.readyState < 1) { nudge.prevT = -1; nudge.at = Date.now(); return; }
+      let ahead = 0, first = -1, last = -1, covered = false;
+      try {
+        const b = v.buffered;
+        if (b.length) { first = b.start(0); last = b.end(b.length - 1); }
+        for (let i = 0; i < b.length; i++) {
+          if (v.currentTime >= b.start(i) - 0.1 && v.currentTime < b.end(i)) {
+            covered = true;
+            ahead = b.end(i) - v.currentTime;
+          }
+        }
+      } catch (e) {}
+      const t = v.currentTime;
+      if (first < 0 || t !== nudge.prevT) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      // A playhead outside every buffered range has nothing under it to play, and a step of a third
+      // of a second reaches none of it: it has to be carried to the media. Sitting inside a range is
+      // the opposite case, however little is left ahead, since a start still filling looks exactly
+      // like that. Where a load named a position, that is where the media is meant to be.
+      // Parked means sitting on content with plenty of it left ahead and still not moving. A playhead
+      // inside a range with barely any ahead of it is starving, not parked, and a step forward from
+      // there lands past the end of what has arrived.
+      const adrift = !covered && (t < first - 5 || t > last + 5);
+      const parked = covered && ahead >= 1;
+      if (!parked && !adrift) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      if (Date.now() - nudge.at < 4000) return;
+      nudge.left--;
+      nudge.at = Date.now();
+      const to = adrift ? Math.max(nudge.want, first) : t;
+      try { v.currentTime = to + 0.3; } catch (e) {}
+      try { v.play(); } catch (e) {}
+    }, 1000);
+
+    // Skipping through a long recording. The remote's key auto-repeat fires far faster than a person
+    // can judge, so the jump runs on a clock of its own instead of once per repeat, and the step grows
+    // the longer the key stays down, falling back to the smallest once it is released. Only for a
+    // finite, seekable stream long enough to need it; a short piece and a live edge keep the player's
+    // own behaviour.
+    const SEEK_STEPS = [10, 30, 60, 300];  // seconds per tick, by how long the key has been held
+    const SEEK_TIERS = [3000, 6000, 9000]; // ms held before each next step takes over
+    const SEEK_TICK = 400;                 // how often a held key moves the playhead
+    const SEEK_END = 700;                  // no key for this long ends the gesture, so it starts small again
+    let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0, settleTimer = 0;
+    const spdEl = document.getElementById('spd');
+    const spdT = document.getElementById('spdT');
+    const spdA = document.getElementById('spdA');
+    function hms(sec) {
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
+      return h ? h + 'h ' + m + 'm ' + x + 's' : m ? m + 'm ' + x + 's' : x + 's';
+    }
+
+    function seekKeyDir(e) {
+      const k = (e.key || '').toLowerCase();
+      if (k === 'mediafastforward' || k === 'arrowright' || e.keyCode === 417 || e.keyCode === 39) return 1;
+      if (k === 'mediarewind' || k === 'arrowleft' || e.keyCode === 412 || e.keyCode === 37) return -1;
+      return 0;
+    }
+    // The player shows its controls for any key it handles; the seek keys are taken before they get
+    // there, so hand it one it does nothing with, which still counts as activity and brings them up.
+    function wakeControls() {
+      try {
+        const el = document.querySelector('cast-media-player') || window;
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', keyCode: 38, bubbles: true }));
+      } catch (x) {}
+    }
+    // The progress bar lives in the player's shadow root, so find it by shape rather than by a class
+    // name that is not ours to rely on: the widest short box in the lower part of the screen.
+    let barBox = null, barAt = 0;
+    function scrubberRect() {
+      const now = Date.now();
+      if (barBox && now - barAt < 1000) return barBox;
+      const host = document.querySelector('cast-media-player');
+      const root = host && host.shadowRoot;
+      if (!root) return null;
+      const W = innerWidth || 0, H = innerHeight || 0;
+      if (!W || !H) return null;
+      let best = null;
+      for (const el of root.querySelectorAll('*')) {
+        const b = el.getBoundingClientRect();
+        if (b.width > W * 0.4 && b.height > 0 && b.height < 30 && b.top > H * 0.5) {
+          if (!best || b.width > best.width || (b.width === best.width && b.top > best.top)) best = b;
+        }
+      }
+      barBox = best; barAt = now;
+      return best;
+    }
+    function showSpeed(tier, frac, at, dir) {
+      // Ride the player's scrubber when it can be located. Its markup is not ours, so when the shape
+      // search comes up empty the marks still appear, over the strip the bar occupies.
+      const b = scrubberRect();
+      const W = innerWidth || 1280, H = innerHeight || 720;
+      const box = b && b.width > 0 ? b : { left: W * 0.06, width: W * 0.88, top: H - 86 };
+      frac = Math.min(1, Math.max(0, frac || 0));
+      spdT.textContent = hms(at);
+      spdA.textContent = (dir < 0 ? '\u25c2' : '\u25b8').repeat(tier);
+      spdEl.style.left = Math.round(box.left + box.width * frac) + 'px';
+      spdEl.style.top = Math.round(box.top - 6) + 'px';
+      spdEl.classList.add('on');
+      clearTimeout(spdHide);
+      spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
+    }
+    function tryAcceleratedSeek(e) {
+      const dir = seekKeyDir(e);
+      if (!dir) return false;
+      const v = mediaEl();
+      const dur = v && v.duration;
+      if (!v || !isFinite(dur) || dur < 600) return false;   // short or live: leave the player alone
+      const now = Date.now();
+      if (now - lastSeekKey > SEEK_END) { holdFrom = now; lastTick = 0; }   // a fresh press starts small
+      lastSeekKey = now;
+      if (now - lastTick >= SEEK_TICK) {
+        lastTick = now;
+        const held = now - holdFrom;
+        let tier = 1;                      // one step per threshold passed, so the list sets the pace
+        while (tier < SEEK_STEPS.length && held >= SEEK_TIERS[tier - 1]) tier++;
+        const target = Math.min(Math.max(0, v.currentTime + dir * SEEK_STEPS[tier - 1]),
+                                Math.max(0, dur - 5));
+        // Seek through the player, not the media element: its own clock, scrubber and time readout
+        // follow what it was told to do, and a raw element write leaves all three behind.
+        try { playerManager.seek(target); } catch (x) {
+          try { v.currentTime = target; } catch (y) {}
+        }
+        wakeControls();
+        showSpeed(tier, target / dur, target, dir);
+        // Once the gesture is over, a hair's move re-fires seeking with no gesture in flight, which
+        // is what runs the track alignment above on where the seek actually settled.
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          const el = mediaEl();
+          if (el && splitTracks()) { try { el.currentTime = el.currentTime + 0.001; } catch (x) {} }
+        }, SEEK_END + 60);
+      }
+      e.preventDefault(); e.stopPropagation();
+      return true;
+    }
 
     // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the
     // portable event.key name first (Chromecast / Google TV report 'BrowserBack') and fall back to the
@@ -255,43 +498,14 @@
       return e.keyCode === 166 || e.keyCode === 461 || e.keyCode === 10009;
     }
 
-    // Debug readout: press Up, Up, Down, Down on the remote to toggle an on-screen panel showing the
-    // code/key of each press - handy to read what an unfamiliar device sends for BACK. Off by default,
-    // so normal playback shows nothing. The last key also rides along in the status telemetry above.
-    const keyDbg = document.getElementById('keydbg');
-    let dbgOn = false;
-    const combo = [];
-    function dirOf(e) {
-      const k = (e.key || '').toLowerCase();
-      if (k === 'arrowup' || e.keyCode === 38) return 'up';
-      if (k === 'arrowdown' || e.keyCode === 40) return 'down';
-      return '';
-    }
-    function showKey(e) {
-      stats.lastKey = { code: e.keyCode, key: e.key || '' };
-      if (dbgOn) keyDbg.textContent = 'keyCode ' + e.keyCode + '   key "' + (e.key || '') + '"   back=' + isBackKey(e);
-    }
-    function toggleCheck(e) {
-      const d = dirOf(e);
-      if (!d) return;
-      combo.push(d);
-      if (combo.length > 4) combo.shift();
-      if (combo.join(',') === 'up,up,down,down') {
-        dbgOn = !dbgOn;
-        keyDbg.style.display = dbgOn ? 'block' : 'none';
-        keyDbg.textContent = dbgOn ? 'key debug ON' : '';
-        combo.length = 0;
-      }
-    }
-
     // With the player controls visible, a back press just hides them (CAF's default); with them already
     // hidden it exits. CAF shows the controls on any remote key and auto-hides them a few seconds later,
     // so "time since the last key" stands in for the controls being visible. Capture phase, so this runs
     // before <cast-media-player> consumes the key.
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
-      showKey(e);
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
+      if (tryAcceleratedSeek(e)) { lastKeyAt = Date.now(); return; }
       if (isBackKey(e)) {
         if (controlsVisible) {
           lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
@@ -301,7 +515,6 @@
         }
       } else {
         lastKeyAt = Date.now();                    // any other remote key shows the controls
-        toggleCheck(e);
       }
     }, true);
 
