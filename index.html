@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.44';
+    const RX_VERSION = '1.45';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -71,9 +71,40 @@
     // from, for the helper's log.
     let guardMode = false, loader = '';
     const cmds = [];
-    function noteCmd(kind, req) {
-      cmds.push(kind + '@' + String((req && req.senderId) || '-').slice(0, 24));
+    function noteCmd(kind, req, extra) {
+      cmds.push(kind + '@' + String((req && req.senderId) || '-').slice(0, 24) + (extra || ''));
       if (cmds.length > 6) cmds.shift();
+    }
+    // Under guard, the receiver takes a media command only when nothing on the network sent it:
+    // its own seeks and the platform's keys arrive with no sender, while a device that joined
+    // the session names itself. A refused command gets an error back and a note in cmds.
+    let refused = 0;
+    function guarded(kind, req) {
+      const from = String((req && req.senderId) || '');
+      if (!guardMode || !from) return null;
+      refused++;
+      noteCmd(kind, req, '!');
+      try {
+        return new cast.framework.messages.ErrorData(cast.framework.messages.ErrorType.INVALID_REQUEST);
+      } catch (e) { return null; }
+    }
+    // Here a seek by distance resolves against the live range, so a sender that counts from
+    // zero on a live stream still lands near where playback is; an absolute seek lands inside
+    // the range.
+    function boundSeek(req) {
+      const r = liveRange();
+      const v = mediaEl();
+      if (!r || !req) return req;
+      let target = null;
+      if (typeof req.relativeTime === 'number' && isFinite(req.relativeTime)) {
+        const cur = v ? v.currentTime : r.end;
+        target = cur + req.relativeTime;
+        delete req.relativeTime;
+      } else if (typeof req.currentTime === 'number' && isFinite(req.currentTime)) {
+        target = req.currentTime;
+      }
+      if (target != null) req.currentTime = Math.min(r.end, Math.max(r.start + WINDOW_FLOOR, target));
+      return req;
     }
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
@@ -214,20 +245,28 @@
     } catch (e) { stats.lastError = 'focus-intercept/' + e.message; }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
+      const no = guarded('PAUSE', req);
+      if (no) return no;
       noteCmd('PAUSE', req);
       intent.paused = true;
       return req;
     });
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (req) => {
+      const no = guarded('PLAY', req);
+      if (no) return no;
       noteCmd('PLAY', req);
       intent.paused = false;
       return req;
     });
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, (req) => {
-      noteCmd('SEEK', req);
-      return req;
+      const no = guarded('SEEK', req);
+      if (no) return no;
+      noteCmd('SEEK', req, ':' + (req && typeof req.relativeTime === 'number' ? 'r' + Math.round(req.relativeTime) : 'c' + Math.round((req && req.currentTime) || 0)));
+      return rpMode ? boundSeek(req) : req;
     });
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.STOP, (req) => {
+      const no = guarded('STOP', req);
+      if (no) return no;
       noteCmd('STOP', req);
       return req;
     });
@@ -493,7 +532,7 @@
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
-        cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0,
+        cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0, rej: refused || null,
         pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
     }, 2000);
 
