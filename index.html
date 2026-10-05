@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.43';
+    const RX_VERSION = '1.44';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -63,8 +63,18 @@
     // rpEdge: the window's load asked for its live edge; once it plays, the playhead is put back
     // on the edge, since buffering the first segments leaves it behind by however long that took.
     let rpEdge = false;
-    // llMode: the load was tagged low-latency; a replayed window with such a tail is kept at its edge.
+    // llMode: the load carries the low-latency tag; edgeSync holds a replayed window with such a
+    // tail at its edge.
     let llMode = false;
+    // guardMode: the load asked the receiver to take media commands from its own sender alone.
+    // loader is that sender; cmds keeps the last few media commands with the sender each came
+    // from, for the helper's log.
+    let guardMode = false, loader = '';
+    const cmds = [];
+    function noteCmd(kind, req) {
+      cmds.push(kind + '@' + String((req && req.senderId) || '-').slice(0, 24));
+      if (cmds.length > 6) cmds.shift();
+    }
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -145,6 +155,10 @@
         // is tuned like one. Left to the manifest's own suggestion the player holds three segments
         // back, which is most of a minute away from the edge it was asked to sit at.
         const replay = url.indexOf('rp=1') !== -1;
+        guardMode = url.indexOf('guard=1') !== -1;
+        loader = String((req && req.senderId) || '');
+        noteCmd('LOAD', req);
+        clearTimeout(doneTimer);
         rpMode = replay;
         rpOpenAt = replay ? (Number(req.currentTime) || 0) : 0;
         // A replayed window that ends in a low-latency live (its tail is the live itself) sits as
@@ -200,13 +214,34 @@
     } catch (e) { stats.lastError = 'focus-intercept/' + e.message; }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
+      noteCmd('PAUSE', req);
       intent.paused = true;
       return req;
     });
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (req) => {
+      noteCmd('PLAY', req);
       intent.paused = false;
       return req;
     });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, (req) => {
+      noteCmd('SEEK', req);
+      return req;
+    });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.STOP, (req) => {
+      noteCmd('STOP', req);
+      return req;
+    });
+
+    // A load that reached its end, or died, leaves the receiver with nothing to play; after a
+    // minute and a half of that the receiver closes itself, which takes the session off every
+    // device's cast controls. A new load cancels it.
+    let doneTimer = null;
+    function doneSoon(why) {
+      clearTimeout(doneTimer);
+      doneTimer = setTimeout(() => {
+        try { stats.lastError = 'closing/' + why; context.stop(); } catch (e) {}
+      }, 90000);
+    }
 
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
@@ -224,6 +259,7 @@
       }
       return '{' + out.join(' ') + '}';
     }
+    playerManager.addEventListener(EV.MEDIA_FINISHED, (e) => { doneSoon('finished:' + ((e && e.endedReason) || '')); });
     playerManager.addEventListener(EV.ERROR, (e) => {
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
@@ -238,6 +274,7 @@
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => {
+      clearTimeout(doneTimer);        // playing again: not done after all
       splash.classList.add('gone');   // hide the loading logo once playback starts
       nudge.starting = false;         // the load's own seek has landed; the playhead is the element's again
       // A load of a replayed window can name a position inside the window, but a live load may
@@ -388,11 +425,11 @@
         lastT = t;
       });
     }
-    // A replayed window at its edge keeps its distance from the media that has arrived, not from
-    // the player's own idea of the edge: that idea is a clock anchored once at load, and every stall
-    // leaves the playhead further behind it for good. The least buffered ahead over the last three
-    // readings says how close the playhead already runs to what has arrived. With more than a
-    // second of room to spare, the player runs a little fast until the room is down to a moment.
+    // A replayed window at its edge keeps its distance from the media that has arrived rather than
+    // from the edge the player computes: that edge comes from a clock anchored once at load, and
+    // every stall leaves the playhead further behind it for good. The least buffered ahead over the
+    // last three readings is how close the playhead already runs to what has arrived. With more
+    // than a second of room to spare, the player runs a little fast until the room is under a second.
     const sync = { low: [], rate: 1 };
     function edgeRate(rate) {
       if (sync.rate === rate) return;
@@ -456,6 +493,7 @@
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
+        cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0,
         pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
     }, 2000);
 
