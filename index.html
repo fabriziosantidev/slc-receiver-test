@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.42';
+    const RX_VERSION = '1.43';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -63,6 +63,8 @@
     // rpEdge: the window's load asked for its live edge; once it plays, the playhead is put back
     // on the edge, since buffering the first segments leaves it behind by however long that took.
     let rpEdge = false;
+    // llMode: the load was tagged low-latency; a replayed window with such a tail is kept at its edge.
+    let llMode = false;
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -150,6 +152,8 @@
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
           replay ? (lowLat ? 3 : 6) : (isVod ? 0 : (lowLat ? 3 : 14));
         rpEdge = replay && rpOpenAt === 0;
+        llMode = lowLat;
+        sync.low = []; edgeRate(1);
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod && !replay) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
@@ -384,6 +388,26 @@
         lastT = t;
       });
     }
+    // A replayed window at its edge keeps its distance from the media that has arrived, not from
+    // the player's own idea of the edge: that idea is a clock anchored once at load, and every stall
+    // leaves the playhead further behind it for good. The least buffered ahead over the last three
+    // readings says how close the playhead already runs to what has arrived. With more than a
+    // second of room to spare, the player runs a little fast until the room is down to a moment.
+    const sync = { low: [], rate: 1 };
+    function edgeRate(rate) {
+      if (sync.rate === rate) return;
+      sync.rate = rate;
+      try { playerManager.setPlaybackRate(rate); } catch (e) {}
+    }
+    function edgeSync(v, st, buf, lsr) {
+      const near = v && lsr && st === 'playing' && !v.paused && (lsr[1] - v.currentTime) < 12;
+      if (!rpMode || !llMode || !near) { sync.low = []; edgeRate(1); return; }
+      sync.low.push(buf);
+      if (sync.low.length > 3) sync.low.shift();
+      const least = Math.min(...sync.low);
+      if (sync.rate === 1 && sync.low.length === 3 && least > 1.2) edgeRate(1.08);
+      else if (sync.rate !== 1 && least <= 0.7) edgeRate(1);
+    }
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
@@ -417,6 +441,7 @@
         } catch (e) {}
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
+      edgeSync(v, st, buf, lsr);
       let ae = null;
       try {
         const a = document.activeElement;
@@ -431,7 +456,7 @@
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
-        sv: (window.shaka && window.shaka.Player && window.shaka.Player.version) || null }); } catch (e) {}
+        pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
     }, 2000);
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
