@@ -60,8 +60,8 @@
     // rpOpenAt: the position that window's load asked to open at, checked once playback starts
     // (0 when there is nothing to check).
     let rpMode = false, rpOpenAt = 0;
-    // rpEdge: the window's load asked for its live edge; once it plays, the playhead is put back
-    // on the edge, since buffering the first segments leaves it behind by however long that took.
+    // rpEdge: the window's load asked for its live edge; once it plays, the receiver seeks back to the
+    // edge, since buffering the first segments leaves the playhead behind by however long that took.
     let rpEdge = false;
     // llMode: the load carries the low-latency tag; edgeSync holds a replayed window with such a
     // tail at its edge.
@@ -364,9 +364,9 @@
         const v = mediaEl();
         if (v && Math.abs(v.currentTime - want) > 30) { try { playerManager.seek(want); } catch (e) {} }
       }
-      // A window opened at its edge starts playing wherever the playhead was seated when the load
+      // A window opened at its edge starts playing wherever the playhead sat when the load
       // began, while the edge kept moving for as long as the first segments took to buffer. Once
-      // it plays, put it back on the edge the range holds now, if it fell more than a moment short.
+      // it plays, put it back on the edge the range holds by then, if it fell more than a moment short.
       if (rpEdge) {
         rpEdge = false;
         const r = liveRange();
