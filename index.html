@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.45';
+    const RX_VERSION = '1.46';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -66,22 +66,33 @@
     // llMode: the load carries the low-latency tag; edgeSync holds a replayed window with such a
     // tail at its edge.
     let llMode = false;
-    // guardMode: the load asked the receiver to take media commands from its own sender alone.
-    // loader is that sender; cmds keeps the last few media commands with the sender each came
-    // from, for the helper's log.
-    let guardMode = false, loader = '';
+    // guardMode: the load asked the receiver to take media commands from its own senders alone.
+    // ownSenders are the senders that loaded the cast or spoke on this receiver's own namespace
+    // (the helper, under whichever connection it has); cmds keeps the last few media commands
+    // with where each came from, for the helper's log: L for this page itself, - for the
+    // platform, H: for an own sender, X: for any other, ? where the sender could not be read.
+    let guardMode = false;
+    const ownSenders = new Set();
     const cmds = [];
+    function who() {
+      if (reqSender == null) return '?';
+      if (reqSender === '') return '-';
+      if (reqSender === LOCAL_SENDER) return 'L';
+      return (ownSenders.has(reqSender) ? 'H:' : 'X:') + reqSender.slice(-6);
+    }
     function noteCmd(kind, req, extra) {
-      cmds.push(kind + '@' + String((req && req.senderId) || '-').slice(0, 24) + (extra || ''));
+      cmds.push(kind + '@' + who() + (extra || ''));
       if (cmds.length > 6) cmds.shift();
     }
-    // Under guard, the receiver takes a media command only when nothing on the network sent it:
-    // its own seeks and the platform's keys arrive with no sender, while a device that joined
-    // the session names itself. A refused command gets an error back and a note in cmds.
+    // Under guard, the receiver refuses a media command sent by a device that is not one of its
+    // own senders. Its own requests, the platform's, a command that follows a key of the TV's
+    // remote within two and a half seconds, and one whose sender could not be read all go
+    // through. A refused command gets an error back and a note in cmds.
     let refused = 0;
     function guarded(kind, req) {
-      const from = String((req && req.senderId) || '');
-      if (!guardMode || !from) return null;
+      const from = reqSender;
+      if (!guardMode || from == null || from === '' || from === LOCAL_SENDER || ownSenders.has(from)) return null;
+      if (Date.now() - lastRemoteAt < 2500) return null;
       refused++;
       noteCmd(kind, req, '!');
       try {
@@ -120,6 +131,31 @@
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
+    // The sender of each media request. The framework hands an interceptor the request alone,
+    // while the function that calls the interceptor holds the request's sender as well.
+    // hookSenders finds that function by the message it logs and wraps it before any interceptor
+    // is set, since setting one binds it. Where it cannot be found, every request reads as from
+    // an unknown sender (?), which the guard lets through.
+    const LOCAL_SENDER = 'slc-local';
+    let reqSender = null, senderHook = false;
+    (function hookSenders() {
+      try {
+        for (let p = Object.getPrototypeOf(playerManager); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+          for (const k of Object.getOwnPropertyNames(p)) {
+            const d = Object.getOwnPropertyDescriptor(p, k);
+            const f = d && d.value;
+            if (typeof f !== 'function' || f.length !== 3) continue;
+            if (Function.prototype.toString.call(f).indexOf('Interceptor changed requestId') === -1) continue;
+            p[k] = function (type, fn, ev) {
+              reqSender = ev && typeof ev.senderId === 'string' ? ev.senderId : null;
+              try { return f.apply(this, arguments); } finally { reqSender = null; }
+            };
+            senderHook = true;
+            return;
+          }
+        }
+      } catch (e) {}
+    })();
     const splash = document.getElementById('splash');   // branded loading overlay (hidden once playing)
 
     // Tolerant Shaka config: survive the source's segment 404s, stalls and discontinuities.
@@ -187,7 +223,7 @@
         // back, which is most of a minute away from the edge it was asked to sit at.
         const replay = url.indexOf('rp=1') !== -1;
         guardMode = url.indexOf('guard=1') !== -1;
-        loader = String((req && req.senderId) || '');
+        if (reqSender && reqSender !== LOCAL_SENDER) ownSenders.add(reqSender);
         noteCmd('LOAD', req);
         clearTimeout(doneTimer);
         rpMode = replay;
@@ -352,6 +388,7 @@
     // receiver converts the distance into a position using the live range the cast framework holds
     // when the message arrives. It then seeks the load that is already playing, with no new LOAD.
     context.addCustomMessageListener(NS, (ev) => {
+      if (ev && typeof ev.senderId === 'string' && ev.senderId) ownSenders.add(ev.senderId);
       const d = ev && ev.data;
       if (!d || d.type !== 'behind') return;
       const r = liveRange();
@@ -533,6 +570,7 @@
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
         cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0, rej: refused || null,
+        sh: senderHook ? 1 : 0,
         pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
     }, 2000);
 
@@ -752,6 +790,7 @@
     options.playbackConfig = playbackConfig;
     options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
     options.maxInactivity = 3600;
+    options.localSenderId = LOCAL_SENDER;   // the sender this page's own requests carry
     context.start(options);
   </script>
 </body>
