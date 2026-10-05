@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.46';
+    const RX_VERSION = '1.47';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -92,6 +92,7 @@
     function guarded(kind, req) {
       const from = reqSender;
       if (!guardMode || from == null || from === '' || from === LOCAL_SENDER || ownSenders.has(from)) return null;
+      if (/^__\w+__$/.test(from)) return null;    // the platform's own controls, such as the TV's on-screen buttons
       if (Date.now() - lastRemoteAt < 2500) return null;
       refused++;
       noteCmd(kind, req, '!');
@@ -211,7 +212,9 @@
           m.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.TS;
           m.hlsVideoSegmentFormat = cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
         }
-        const isVod = url.indexOf('vod=1') !== -1;
+        // A replayed window is a live presentation whatever else its url says: helper 0.5.13 marks a
+        // YouTube live window with vod=1 as well as rp=1, and loaded as a video it has no live range.
+        const isVod = url.indexOf('vod=1') !== -1 && url.indexOf('rp=1') === -1;
         m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
                              : cast.framework.messages.StreamType.LIVE;
         // Without the ts=1 tag, the player finds the segment format out on its own.
