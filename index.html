@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.41';
+    const RX_VERSION = '1.42';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -60,10 +60,9 @@
     // rpOpenAt: the position that window's load asked to open at, checked once playback starts
     // (0 when there is nothing to check).
     let rpMode = false, rpOpenAt = 0;
-    // liveSeat: how far behind the listing's end the current load seats its playhead (the
-    // manifest delay it was loaded with). Whatever asks for the edge lands that far behind the
-    // listing's end.
-    let liveSeat = 0;
+    // rpEdge: the window's load asked for its live edge; once it plays, the playhead is put back
+    // on the edge, since buffering the first segments leaves it behind by however long that took.
+    let rpEdge = false;
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -150,7 +149,7 @@
         // close to the edge as that live would; one built from a recording alone sits further back.
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
           replay ? (lowLat ? 3 : 6) : (isVod ? 0 : (lowLat ? 3 : 14));
-        liveSeat = playbackConfig.shakaConfig.manifest.defaultPresentationDelay;
+        rpEdge = replay && rpOpenAt === 0;
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod && !replay) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
@@ -246,6 +245,15 @@
         const v = mediaEl();
         if (v && Math.abs(v.currentTime - want) > 30) { try { playerManager.seek(want); } catch (e) {} }
       }
+      // A window opened at its edge starts playing wherever the playhead was seated when the load
+      // began, while the edge kept moving for as long as the first segments took to buffer. Once
+      // it plays, put it back on the edge the range holds now, if it fell more than a moment short.
+      if (rpEdge) {
+        rpEdge = false;
+        const r = liveRange();
+        const v = mediaEl();
+        if (r && v && r.end - v.currentTime > 1.5) { try { playerManager.seek(r.end); } catch (e) {} }
+      }
     });
 
     // The live range the cast framework holds for the current load, or null when it holds none.
@@ -268,10 +276,10 @@
       if (!d || d.type !== 'behind') return;
       const r = liveRange();
       if (!r) return;
-      // The edge is where the load seats its playhead, not the listing's last instant: the media
-      // behind that instant is still arriving, and a playhead set on it waits for every segment.
-      const s = Math.max(liveSeat, Number(d.s) || 0);
-      const target = Math.max(r.start + WINDOW_FLOOR, r.end - s);
+      // The range's end already sits the manifest delay behind the listing's last instant, so
+      // the edge is the end itself.
+      const s = Math.max(0, Number(d.s) || 0);
+      const target = s > 0 ? Math.max(r.start + WINDOW_FLOOR, r.end - s) : r.end;
       try { playerManager.seek(target); } catch (e) {}
     });
 
@@ -422,7 +430,8 @@
         pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
-        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
+        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
+        sv: (window.shaka && window.shaka.Player && window.shaka.Player.version) || null }); } catch (e) {}
     }, 2000);
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
@@ -572,7 +581,7 @@
       const r = rpMode ? liveRange() : null;
       if (rpMode && !r) return false;
       const lo = r ? r.start + WINDOW_FLOOR : 0;
-      const hi = r ? r.end - liveSeat : (isFinite(dur) ? Math.max(0, dur - 5) : 0);
+      const hi = r ? r.end : (isFinite(dur) ? Math.max(0, dur - 5) : 0);
       if (hi - lo < 600) return false;   // short or a plain live edge: leave the player alone
       const now = Date.now();
       if (now - lastSeekKey > SEEK_END) { holdFrom = now; lastTick = 0; }   // a fresh press starts small
