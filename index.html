@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.48';
+    const RX_VERSION = '1.49';
     const stats = { stalls: 0, lastError: null };
     // What this device says it can decode, read once: the display check the cast runtime answers and
     // the media source's own. A source in a codec the device cannot decode fetches and then never plays.
@@ -227,6 +227,11 @@
         if (url.indexOf('ts=1') !== -1) {
           m.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.TS;
           m.hlsVideoSegmentFormat = cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
+        } else if (url.indexOf('fmp4=1') !== -1) {
+          // A playlist tagged fmp4=1 carries fragmented MP4 segments. Left unsaid, the framework
+          // takes HLS segments for MPEG-TS, and such a load fetches its segments and never plays.
+          m.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.FMP4;
+          m.hlsVideoSegmentFormat = cast.framework.messages.HlsVideoSegmentFormat.FMP4;
         }
         // A replayed window is a live presentation whatever else its url says: helper 0.5.13 marks a
         // YouTube live window with vod=1 as well as rp=1, and loaded as a video it has no live range.
