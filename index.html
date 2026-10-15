@@ -45,8 +45,24 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.47';
+    const RX_VERSION = '1.48';
     const stats = { stalls: 0, lastError: null };
+    // What this device says it can decode, read once: the display check the cast runtime answers and
+    // the media source's own. A source in a codec the device cannot decode fetches and then never plays.
+    let codecNote = null;
+    function codecSupport() {
+      if (codecNote !== null) return codecNote;
+      const probes = [['h264', 'avc1.4D401F'], ['hev1', 'hev1.1.6.L150.90'], ['hvc1', 'hvc1.1.6.L150.90'], ['av1', 'av01.0.08M.08']];
+      const out = [];
+      for (const [name, c] of probes) {
+        let d = '?', m = '?';
+        try { d = context.canDisplayType('video/mp4', c, 1920, 1080, 60) ? 'y' : 'n'; } catch (e) {}
+        try { m = window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="' + c + '"') ? 'y' : 'n'; } catch (e) {}
+        out.push(name + ':' + d + m);
+      }
+      codecNote = out.join(' ');
+      return codecNote;
+    }
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
     const nudge = { left: 3, prevT: -1, at: 0, want: 0, starting: false };
@@ -574,7 +590,9 @@
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
         cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0, rej: refused || null,
         sh: senderHook ? 1 : 0,
-        pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
+        pr: sync.rate !== 1 ? sync.rate : null,
+        cd: codecSupport(),
+        ve: (v && v.error) ? (v.error.code + (v.error.message ? ':' + String(v.error.message).slice(0, 60) : '')) : null }); } catch (e) {}
     }, 2000);
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
